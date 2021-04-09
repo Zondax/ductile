@@ -164,12 +164,11 @@
 #[macro_use]
 extern crate log;
 
-use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chacha20::stream_cipher::{NewStreamCipher, SyncStreamCipher};
 use chacha20::{ChaCha20, Key, Nonce};
@@ -177,6 +176,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use failure::{bail, Error};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// A magic constant used to check the protocol integrity between two remote hosts.
@@ -230,9 +230,9 @@ enum ChannelReceiverInner<T> {
     /// The connection is only a local in-memory channel.
     Local(Receiver<ChannelMessage<T>>),
     /// The connection is with a remote party over a TCP socket.
-    Remote(RefCell<TcpStream>),
+    Remote(Mutex<TcpStream>),
     /// The connection is with a remote party and it is encrypted using ChaCha20.
-    RemoteEnc(RefCell<(TcpStream, ChaCha20)>),
+    RemoteEnc(Mutex<(TcpStream, ChaCha20)>),
 }
 
 /// The channel part that receives data. It is generic over the type of messages sent in the
@@ -271,12 +271,12 @@ where
                 .send(ChannelMessage::Message(data))
                 .map_err(|e| e.into()),
             ChannelSenderInner::Remote(sender) => {
-                let mut sender = sender.lock().unwrap();
+                let mut sender = sender.lock();
                 let stream = sender.deref_mut();
                 ChannelSender::<T>::send_remote_raw(stream, ChannelMessage::Message(data))
             }
             ChannelSenderInner::RemoteEnc(stream) => {
-                let mut stream = stream.lock().unwrap();
+                let mut stream = stream.lock();
                 let (stream, enc) = stream.deref_mut();
                 ChannelSender::<T>::send_remote_raw_enc(stream, enc, ChannelMessage::Message(data))
             }
@@ -303,7 +303,7 @@ where
                 Ok(sender.send(ChannelMessage::RawData(data.into()))?)
             }
             ChannelSenderInner::Remote(sender) => {
-                let mut sender = sender.lock().expect("Cannot lock ChannelSender");
+                let mut sender = sender.lock();
                 let stream = sender.deref_mut();
                 ChannelSender::<T>::send_remote_raw(
                     stream,
@@ -312,7 +312,7 @@ where
                 Ok(stream.write_all(&data)?)
             }
             ChannelSenderInner::RemoteEnc(stream) => {
-                let mut stream = stream.lock().unwrap();
+                let mut stream = stream.lock();
                 let (stream, enc) = stream.deref_mut();
                 ChannelSender::<T>::send_remote_raw_enc(
                     stream,
@@ -409,7 +409,7 @@ where
             ChannelReceiverInner::Local(receiver) => receiver.recv()?,
             ChannelReceiverInner::Remote(receiver) => ChannelReceiver::recv_remote_raw(receiver)?,
             ChannelReceiverInner::RemoteEnc(receiver) => {
-                let mut receiver = receiver.borrow_mut();
+                let mut receiver = receiver.lock();
                 let (receiver, decryptor) = receiver.deref_mut();
                 ChannelReceiver::recv_remote_raw_enc(receiver, decryptor)?
             }
@@ -441,7 +441,7 @@ where
             ChannelReceiverInner::Remote(receiver) => {
                 match ChannelReceiver::<T>::recv_remote_raw(receiver)? {
                     ChannelMessage::RawDataStart(len) => {
-                        let mut receiver = receiver.borrow_mut();
+                        let mut receiver = receiver.lock();
                         let mut buf = vec![0u8; len];
                         receiver.read_exact(&mut buf)?;
                         Ok(buf)
@@ -450,7 +450,7 @@ where
                 }
             }
             ChannelReceiverInner::RemoteEnc(receiver) => {
-                let mut receiver = receiver.borrow_mut();
+                let mut receiver = receiver.lock();
                 let (receiver, decryptor) = receiver.deref_mut();
                 match ChannelReceiver::<T>::recv_remote_raw_enc(receiver, decryptor)? {
                     ChannelMessage::RawDataStart(_) => {
@@ -464,8 +464,8 @@ where
     }
 
     /// Receive a message from the TCP stream of a channel.
-    fn recv_remote_raw(receiver: &RefCell<TcpStream>) -> Result<ChannelMessage<T>> {
-        let mut receiver = receiver.borrow_mut();
+    fn recv_remote_raw(receiver: &Mutex<TcpStream>) -> Result<ChannelMessage<T>> {
+        let mut receiver = receiver.lock();
         Ok(bincode::deserialize_from(receiver.deref_mut())?)
     }
 
@@ -695,7 +695,7 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                             )))),
                         },
                         ChannelReceiver {
-                            inner: ChannelReceiverInner::RemoteEnc(RefCell::new((receiver, dec))),
+                            inner: ChannelReceiverInner::RemoteEnc(Mutex::new((receiver, dec))),
                         },
                         peer_addr,
                     ));
@@ -711,7 +711,7 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                             inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(sender))),
                         },
                         ChannelReceiver {
-                            inner: ChannelReceiverInner::Remote(RefCell::new(receiver)),
+                            inner: ChannelReceiverInner::Remote(Mutex::new(receiver)),
                         },
                         peer_addr,
                     ));
@@ -756,7 +756,7 @@ pub fn connect_channel<A: ToSocketAddrs, S, R>(
             inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(stream))),
         },
         ChannelReceiver {
-            inner: ChannelReceiverInner::Remote(RefCell::new(stream2)),
+            inner: ChannelReceiverInner::Remote(Mutex::new(stream2)),
         },
     ))
 }
@@ -802,7 +802,7 @@ pub fn connect_channel_with_enc<A: ToSocketAddrs, S, R>(
             inner: ChannelSenderInner::RemoteEnc(Arc::new(Mutex::new((stream, enc)))),
         },
         ChannelReceiver {
-            inner: ChannelReceiverInner::RemoteEnc(RefCell::new((stream2, dec))),
+            inner: ChannelReceiverInner::RemoteEnc(Mutex::new((stream2, dec))),
         },
     ))
 }
